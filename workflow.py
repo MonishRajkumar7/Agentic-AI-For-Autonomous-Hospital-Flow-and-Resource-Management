@@ -2,22 +2,59 @@ import asyncio
 import json
 import os
 import uuid
+import traceback
+
 import streamlit as st
 import httpx
 
 from typing import TypedDict
 from dotenv import load_dotenv
+
 from langchain_google_genai import ChatGoogleGenerativeAI
+
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+
 from langgraph.graph import StateGraph, START, END
+
 from database import get_resources
+
+
+# ============================================================
+# 1. ENVIRONMENT CONFIGURATION
+# ============================================================
 
 load_dotenv()
 
-A2A_SERVER_URL = "http://127.0.0.1:9999/"
-MCP_SERVER_URL = "http://127.0.0.1:8000/mcp"
 
+def get_setting(name, default=None):
+    """Read settings from environment variables or Streamlit Secrets."""
+
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+A2A_SERVER_URL = get_setting(
+    "A2A_SERVER_URL",
+    "http://127.0.0.1:9999/"
+)
+
+MCP_SERVER_URL = get_setting(
+    "MCP_SERVER_URL",
+    "http://127.0.0.1:8000/mcp"
+)
+
+
+# ============================================================
+# 2. HOSPITAL WORKFLOW STATE
+# ============================================================
 
 class HospitalState(TypedDict):
     patient_code: str
@@ -31,7 +68,12 @@ class HospitalState(TypedDict):
     ai_summary: str
 
 
+# ============================================================
+# 3. PATIENT INTAKE
+# ============================================================
+
 def patient_intake(state: HospitalState):
+
     symptoms = state["symptoms"].lower()
 
     critical_words = [
@@ -58,17 +100,25 @@ def patient_intake(state: HospitalState):
 
     if any(word in symptoms for word in critical_words):
         priority = "Critical flag"
+
     elif any(word in symptoms for word in high_priority_keywords):
         priority = "High priority flag"
+
     elif any(word in symptoms for word in urgent_words):
         priority = "Urgent flag"
+
     else:
         priority = "Routine review flag"
 
     return {"priority": priority}
 
 
+# ============================================================
+# 4. RESOURCE MONITOR
+# ============================================================
+
 def resource_monitor(state: HospitalState):
+
     resources = get_resources()
 
     summary = "; ".join(
@@ -80,7 +130,12 @@ def resource_monitor(state: HospitalState):
     return {"resource_summary": summary}
 
 
+# ============================================================
+# 5. A2A OPERATIONS AGENT
+# ============================================================
+
 def a2a_operations_agent(state: HospitalState):
+
     query = "Summarize available hospital resources"
 
     payload = {
@@ -102,50 +157,86 @@ def a2a_operations_agent(state: HospitalState):
     }
 
     try:
-        with httpx.Client(timeout=15.0) as client:
-            response = client.post(A2A_SERVER_URL, json=payload)
+
+        with httpx.Client(timeout=60.0) as client:
+
+            response = client.post(
+                A2A_SERVER_URL,
+                json=payload
+            )
+
             response.raise_for_status()
+
             result = response.json()
 
         if "error" in result:
-            summary = f"A2A agent returned an error: {result['error']}"
+
+            summary = (
+                f"A2A agent returned an error: {result['error']}"
+            )
+
         else:
+
             task = result.get("result", {})
-            status = task.get("status", {}).get("state", "")
+
+            status = task.get(
+                "status", {}
+            ).get("state", "")
 
             if status != "completed":
+
                 summary = (
-                    f"A2A task did not complete successfully. "
+                    "A2A task did not complete successfully. "
                     f"Status: {status or 'unknown'}"
                 )
+
             else:
+
                 messages = []
 
                 for artifact in task.get("artifacts", []):
+
                     for part in artifact.get("parts", []):
+
                         if part.get("kind") == "text":
-                            messages.append(part.get("text", ""))
+
+                            messages.append(
+                                part.get("text", "")
+                            )
 
                 summary = "\n".join(messages) or (
                     "A2A task completed without a text artifact."
                 )
 
-    except (httpx.HTTPError, ValueError) as error:
+    except Exception as error:
+
         summary = (
-            "A2A agent is unavailable. "
-            f"Local resource monitoring is still available. Details: {error}"
+            "A2A agent is unavailable.\n"
+            f"Details: {type(error).__name__}: {error}"
         )
 
     return {"a2a_summary": summary}
 
 
+# ============================================================
+# 6. MCP DATA FETCHING
+# ============================================================
+
 async def fetch_mcp_data():
-    async with streamable_http_client(MCP_SERVER_URL) as (
+
+    async with streamable_http_client(
+        MCP_SERVER_URL
+    ) as (
         read_stream,
         write_stream,
-        _,
+        _
     ):
-        async with ClientSession(read_stream, write_stream) as session:
+
+        async with ClientSession(
+            read_stream,
+            write_stream
+        ) as session:
+
             await session.initialize()
 
             resources = await session.call_tool(
@@ -164,12 +255,23 @@ async def fetch_mcp_data():
             }
 
 
+# ============================================================
+# 7. MCP RESOURCE MONITOR
+# ============================================================
+
 def mcp_monitor(state: HospitalState):
+
     try:
+
         data = asyncio.run(fetch_mcp_data())
 
         def extract_result(result):
-            structured = getattr(result, "structuredContent", None)
+
+            structured = getattr(
+                result,
+                "structuredContent",
+                None
+            )
 
             if structured is not None:
                 return structured
@@ -183,28 +285,50 @@ def mcp_monitor(state: HospitalState):
             return text_parts if text_parts else str(result)
 
         resource_data = extract_result(data["resources"])
+
         patient_data = extract_result(data["patients"])
 
         summary = (
             "MCP resource inventory:\n"
-            + json.dumps(resource_data, indent=2, default=str)
+            + json.dumps(
+                resource_data,
+                indent=2,
+                default=str
+            )
             + "\n\nMCP patient queue:\n"
-            + json.dumps(patient_data, indent=2, default=str)
+            + json.dumps(
+                patient_data,
+                indent=2,
+                default=str
+            )
         )
 
     except Exception as error:
-        summary = f"MCP connection failed: {error}"
+
+        error_details = "".join(
+            traceback.format_exception(error)
+        )
+
+        summary = (
+            "MCP CONNECTION FAILED\n\n"
+            f"Error type: {type(error).__name__}\n\n"
+            f"Error details:\n{error_details}"
+        )
 
     return {"mcp_summary": summary}
 
 
+# ============================================================
+# 8. GEMINI AI SUMMARY
+# ============================================================
+
 def gemini_summary(state: HospitalState):
-    """Generate a Gemini summary with a local fallback."""
 
     prompt = f"""
 You are a hospital operations assistant.
 
 Generate a short administrative update using ONLY the information supplied.
+
 Never invent patient counts, resource availability, hospital statistics,
 dates, staffing information, or operational events.
 
@@ -238,37 +362,44 @@ Do not diagnose patients or recommend treatment.
 This is an educational simulation.
 """
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-
-    if not api_key:
-        try:
-            api_key = st.secrets.get("GOOGLE_API_KEY")
-        except Exception:
-            api_key = None
+    api_key = get_setting("GOOGLE_API_KEY")
 
     def local_fallback(reason):
+
         return (
             "### Patient Overview\n"
-            f"Patient {state['patient_code']} (age {state['age']}) "
-            f"was processed. Recorded flag: {state['priority']}.\n\n"
+            f"Patient {state['patient_code']} "
+            f"(age {state['age']}) was processed. "
+            f"Recorded flag: {state['priority']}.\n\n"
+
             "### Available Resources\n"
             f"{state['resource_summary'] or 'Resource information unavailable.'}\n\n"
+
             "### Patient Queue\n"
             f"{state['mcp_summary']}\n\n"
+
             "### System Status\n"
             f"{state['a2a_summary']}\n\n"
+
             "### Important Notes\n"
             f"Gemini summary unavailable: {reason}. "
             "This is a locally generated summary using supplied workflow data."
         )
 
     if not api_key:
+
         return {
-            "ai_summary": local_fallback("GOOGLE_API_KEY is missing")
+            "ai_summary": local_fallback(
+                "GOOGLE_API_KEY is missing"
+            )
         }
 
     try:
-        model_name = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+
+        model_name = get_setting(
+            "GOOGLE_MODEL",
+            "gemini-3.8-flash"
+        )
 
         model = ChatGoogleGenerativeAI(
             model=model_name,
@@ -279,16 +410,21 @@ This is an educational simulation.
         )
 
         response = model.invoke(prompt)
+
         summary = response.content
 
         if isinstance(summary, list):
+
             text_parts = []
 
             for block in summary:
+
                 if isinstance(block, dict):
                     text_value = block.get("text", "")
+
                 elif isinstance(block, str):
                     text_value = block
+
                 else:
                     text_value = getattr(block, "text", "")
 
@@ -306,12 +442,18 @@ This is an educational simulation.
         return {"ai_summary": summary}
 
     except Exception as error:
+
         return {
             "ai_summary": local_fallback(str(error)[:300])
         }
 
 
+# ============================================================
+# 9. COORDINATOR
+# ============================================================
+
 def coordinator(state: HospitalState):
+
     report = (
         f"Patient ID: {state['patient_code']}\n"
         f"Age: {state['age']}\n"
@@ -327,6 +469,10 @@ def coordinator(state: HospitalState):
 
     return {"final_report": report}
 
+
+# ============================================================
+# 10. LANGGRAPH WORKFLOW
+# ============================================================
 
 builder = StateGraph(HospitalState)
 
@@ -348,7 +494,12 @@ builder.add_edge("coordinator", END)
 hospital_workflow = builder.compile()
 
 
+# ============================================================
+# 11. PROCESS PATIENT
+# ============================================================
+
 def process_patient(patient_code, age, symptoms):
+
     return hospital_workflow.invoke({
         "patient_code": patient_code,
         "age": age,
