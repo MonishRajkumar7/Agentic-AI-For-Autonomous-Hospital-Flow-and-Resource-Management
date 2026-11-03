@@ -1,4 +1,3 @@
-```python
 import os
 
 from mcp.server.fastmcp import FastMCP
@@ -29,9 +28,7 @@ def get_patient_queue() -> list[dict]:
 if __name__ == "__main__":
     print("Starting Hospital Flow MCP server...")
 
-    # Render cloud configuration
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
 
     mcp.run(transport="streamable-http")
-```
